@@ -1,13 +1,16 @@
 import 'dart:async';
 
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../models/notification.dart';
 
 class NotificationService extends ChangeNotifier {
   final FirebaseMessaging? _firebaseMessaging;
+  final Future<void> Function()? _firebaseInitializer;
   final FlutterLocalNotificationsPlugin _flutterLocalNotificationsPlugin;
   final int _maxRetries;
   final Duration _retryDelay;
@@ -15,14 +18,18 @@ class NotificationService extends ChangeNotifier {
 
   final List<NotificationModel> _pendingNotifications = [];
   bool _initialized = false;
+  bool _lastSendSucceeded = false;
+  String? _lastError;
 
   NotificationService({
     FirebaseMessaging? firebaseMessaging,
     FlutterLocalNotificationsPlugin? localNotificationsPlugin,
+    Future<void> Function()? firebaseInitializer,
     int maxRetries = 3,
     Duration? retryDelay,
     Future<void> Function(NotificationModel notification)? dispatcher,
   })  : _firebaseMessaging = firebaseMessaging,
+        _firebaseInitializer = firebaseInitializer,
         _flutterLocalNotificationsPlugin =
             localNotificationsPlugin ?? FlutterLocalNotificationsPlugin(),
         _maxRetries = maxRetries,
@@ -31,7 +38,10 @@ class NotificationService extends ChangeNotifier {
   }
 
   bool get initialized => _initialized;
-  List<NotificationModel> get pendingNotifications => List.unmodifiable(_pendingNotifications);
+  bool get lastSendSucceeded => _lastSendSucceeded;
+  String? get lastError => _lastError;
+  List<NotificationModel> get pendingNotifications =>
+      List.unmodifiable(_pendingNotifications);
 
   Future<void> initialize() async {
     if (_initialized) {
@@ -45,9 +55,15 @@ class NotificationService extends ChangeNotifier {
     }
 
     try {
-      final firebaseMessaging = _firebaseMessaging ?? FirebaseMessaging.instance;
+      final firebaseMessaging =
+          _firebaseMessaging ?? FirebaseMessaging.instance;
 
-      const androidInitializationSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+      if (Firebase.apps.isEmpty) {
+        await (_firebaseInitializer ?? Firebase.initializeApp)();
+      }
+
+      const androidInitializationSettings =
+          AndroidInitializationSettings('@mipmap/ic_launcher');
       const iosInitializationSettings = DarwinInitializationSettings();
       const initializationSettings = InitializationSettings(
         android: androidInitializationSettings,
@@ -55,6 +71,11 @@ class NotificationService extends ChangeNotifier {
       );
 
       await _flutterLocalNotificationsPlugin.initialize(initializationSettings);
+
+      final permissionGranted = await _requestNotificationPermission();
+      if (!permissionGranted) {
+        _lastError = 'No se concedieron permisos para mostrar notificaciones.';
+      }
 
       const androidChannel = AndroidNotificationChannel(
         'push_channel',
@@ -64,22 +85,32 @@ class NotificationService extends ChangeNotifier {
       );
 
       await _flutterLocalNotificationsPlugin
-          .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+          .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>()
           ?.createNotificationChannel(androidChannel);
 
-      await firebaseMessaging.requestPermission();
+      final settings = await firebaseMessaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+        provisional: false,
+      );
 
-      FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
-        final notification = NotificationModel(
-          title: message.notification?.title ?? 'Nueva actualización',
-          body: message.notification?.body ?? 'Tienes un nuevo mensaje.',
-          payload: message.data['payload'],
-          platform: message.data['platform'] ?? 'mobile',
-        );
-        await _showNotification(notification);
-      });
+      if (settings.authorizationStatus == AuthorizationStatus.authorized ||
+          settings.authorizationStatus == AuthorizationStatus.provisional) {
+        FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
+          final notification = NotificationModel(
+            title: message.notification?.title ?? 'Nueva actualización',
+            body: message.notification?.body ?? 'Tienes un nuevo mensaje.',
+            payload: message.data['payload'],
+            platform: message.data['platform'] ?? 'mobile',
+          );
+          await _showNotification(notification);
+        });
+      }
     } catch (error) {
-      debugPrint('No se pudo inicializar el servicio nativo: $error');
+      _lastError = 'No se pudo inicializar el servicio nativo: $error';
+      debugPrint(_lastError);
       _initialized = true;
       notifyListeners();
       return;
@@ -89,7 +120,8 @@ class NotificationService extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<NotificationModel> sendNotification({NotificationModel? notification, int? maxRetries}) async {
+  Future<NotificationModel> sendNotification(
+      {NotificationModel? notification, int? maxRetries}) async {
     final model = notification ??
         NotificationModel(
           title: 'Oferta',
@@ -97,11 +129,21 @@ class NotificationService extends ChangeNotifier {
           payload: 'offer-001',
         );
 
-    await _dispatchWithRetry(model, maxRetries: maxRetries ?? _maxRetries);
+    try {
+      await _dispatchWithRetry(model, maxRetries: maxRetries ?? _maxRetries);
+      _lastSendSucceeded = true;
+      _lastError = null;
+    } catch (error) {
+      _lastSendSucceeded = false;
+      _lastError = error.toString();
+      debugPrint(_lastError);
+    }
+
     return model;
   }
 
-  Future<void> _dispatchWithRetry(NotificationModel notification, {required int maxRetries, int attempt = 1}) async {
+  Future<void> _dispatchWithRetry(NotificationModel notification,
+      {required int maxRetries, int attempt = 1}) async {
     try {
       await _sendHandler(notification);
       _pendingNotifications.remove(notification);
@@ -109,12 +151,15 @@ class NotificationService extends ChangeNotifier {
     } catch (error) {
       if (attempt < maxRetries) {
         _pendingNotifications.add(notification);
-        await Future<void>.delayed(Duration(milliseconds: _retryDelay.inMilliseconds * attempt));
-        await _dispatchWithRetry(notification, maxRetries: maxRetries, attempt: attempt + 1);
+        await Future<void>.delayed(
+            Duration(milliseconds: _retryDelay.inMilliseconds * attempt));
+        await _dispatchWithRetry(notification,
+            maxRetries: maxRetries, attempt: attempt + 1);
       } else {
         _pendingNotifications.add(notification);
         notifyListeners();
-        throw Exception('No se pudo enviar la notificación después de $maxRetries intentos: $error');
+        throw Exception(
+            'No se pudo enviar la notificación después de $maxRetries intentos: $error');
       }
     }
   }
@@ -125,7 +170,8 @@ class NotificationService extends ChangeNotifier {
     }
 
     if (kIsWeb) {
-      debugPrint('Notificación web simulada: ${notification.title} - ${notification.body}');
+      debugPrint(
+          'Notificación web simulada: ${notification.title} - ${notification.body}');
       return;
     }
 
@@ -136,6 +182,7 @@ class NotificationService extends ChangeNotifier {
       importance: Importance.max,
       priority: Priority.high,
       ticker: 'ticker',
+      icon: '@mipmap/ic_launcher',
     );
 
     const iOSPlatformChannelSpecifics = DarwinNotificationDetails();
@@ -152,9 +199,27 @@ class NotificationService extends ChangeNotifier {
         platformChannelSpecifics,
         payload: notification.payload ?? 'default-payload',
       );
+      _lastSendSucceeded = true;
+      _lastError = null;
     } catch (error) {
-      debugPrint('No se pudo mostrar la notificación nativa: $error');
+      _lastSendSucceeded = false;
+      _lastError = 'No se pudo mostrar la notificación nativa: $error';
+      debugPrint(_lastError);
     }
+  }
+
+  Future<bool> _requestNotificationPermission() async {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      final status = await Permission.notification.request();
+      return status.isGranted || status.isLimited || status.isProvisional;
+    }
+
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      final status = await Permission.notification.request();
+      return status.isGranted || status.isLimited || status.isProvisional;
+    }
+
+    return true;
   }
 
   Future<void> _showNotification(NotificationModel notification) async {

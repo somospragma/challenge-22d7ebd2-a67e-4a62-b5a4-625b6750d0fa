@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter_test/flutter_test.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -36,7 +34,8 @@ class FakeFirebaseMessaging extends Fake implements FirebaseMessaging {
   }
 }
 
-class FakeLocalNotificationsPlugin extends Fake implements FlutterLocalNotificationsPlugin {
+class FakeLocalNotificationsPlugin extends Fake
+    implements FlutterLocalNotificationsPlugin {
   int callCount = 0;
   NotificationDetails? lastDetails;
   String? lastPayload;
@@ -73,7 +72,8 @@ class FakeLocalNotificationsPlugin extends Fake implements FlutterLocalNotificat
   }
 }
 
-class FailingLocalNotificationsPlugin extends Fake implements FlutterLocalNotificationsPlugin {
+class FailingLocalNotificationsPlugin extends Fake
+    implements FlutterLocalNotificationsPlugin {
   @override
   Future<bool?> initialize(
     InitializationSettings initializationSettings, {
@@ -143,7 +143,8 @@ void main() {
       expect(attempts, 3);
     });
 
-    test('no falla cuando la inicialización nativa no está disponible', () async {
+    test('no falla cuando la inicialización nativa no está disponible',
+        () async {
       final service = NotificationService(
         firebaseMessaging: FakeFirebaseMessaging(),
         localNotificationsPlugin: FailingLocalNotificationsPlugin(),
@@ -164,6 +165,22 @@ void main() {
         completes,
       );
       expect(service.initialized, isTrue);
+    });
+
+    test('continúa si la inicialización de Firebase falla', () async {
+      final service = NotificationService(
+        firebaseMessaging: FakeFirebaseMessaging(),
+        localNotificationsPlugin: FakeLocalNotificationsPlugin(),
+        maxRetries: 1,
+        retryDelay: const Duration(milliseconds: 1),
+        firebaseInitializer: () async {
+          throw Exception('Firebase no disponible');
+        },
+      );
+
+      await expectLater(service.initialize(), completes);
+      expect(service.initialized, isTrue);
+      expect(service.lastError, contains('No se pudo inicializar el servicio nativo'));
     });
   });
 }
